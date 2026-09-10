@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bilibili-multi-part"
+version = "1.0.0"
+description = "B 站分 P 视频全部分集下载 + LLM 笔记生成（自包含脚本）"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "BiliNote" }]
+dependencies = [
+    "yt-dlp>=2024.0.0",
+    "requests>=2.31.0",
+    "openai>=1.0.0",
+]
+
+[project.optional-dependencies]
+# 不生成 LLM 笔记时的最小依赖
+base = ["yt-dlp>=2024.0.0", "requests>=2.31.0"]
+
+[project.scripts]
+bilibili-multi-part = "bilibili_multi_part:main"
+
+[tool.setuptools]
+py-modules = ["bilibili_multi_part"]

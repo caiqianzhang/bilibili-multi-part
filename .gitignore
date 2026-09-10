@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtualenv
+.venv/
+venv/
+env/
+
+# 环境变量（含敏感 cookie）
+.env
+
+# 运行时产出
+bilibili_out/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+# ASR 虚拟环境（含 torch，体积大）
+.venv-asr/
+
+# 会话/工具产物
+.remember/
