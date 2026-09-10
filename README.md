@@ -39,7 +39,7 @@ pip install -e .
 ## 用法
 
 ```bash
-# CLI：下载全部分集到 ./bilibili_out
+# CLI：下载全部分集到 ./bilibili_out/<BV号>/（按课程分子目录）
 python bilibili_multi_part.py "https://www.bilibili.com/video/BV1bK411W797"
 
 # 指定输出目录 + 音质 + 用 Netscape cookie 文件登录（拿 AI 字幕必需）
@@ -67,10 +67,10 @@ results = BilibiliDownloader().download_all_parts(url, output_dir="out")
 
 ## 语义问答（RAG）
 
-对已生成的字幕语料（`$BILI_OUT_ROOT` 下 48 门课 / 约 2700 万字）建立向量索引，
+对已生成的字幕语料（`$BILI_OUT_ROOT` 下的课程目录，规模以 `stats` 输出为准）建立向量索引，
 支持"措辞不同也能命中"的语义检索，以及带 **分集 + 时间点 + 跳转链接** 引用的 LLM 问答。
-技术栈：`bge-m3`（本地 GPU 编码，1024 维）+ SQLite 单文件 + numpy 暴力检索（毫秒级），
-不需要向量数据库服务。用 `.venv-asr` 运行（复用 torch/transformers，另需 `openai` 仅 ask 模式）：
+技术栈：`bge-m3`（本地 GPU 编码，1024 维，嵌入文本带课程/分集上下文前缀）+ SQLite 单文件 +
+numpy 暴力检索（毫秒级），不需要向量数据库服务。用 `.venv-asr` 运行（复用 torch/transformers，另需 `openai` 仅 ask 模式）：
 
 ```bash
 # 1. 建索引：默认增量（字幕指纹无变化的课程秒级跳过，不加载模型），--force 全量重嵌
@@ -80,9 +80,9 @@ results = BilibiliDownloader().download_all_parts(url, output_dir="out")
 
 # 2. 语义检索（不需要 LLM key）：命中结果附 BV号/分集/时间戳/跳转链接
 .venv-asr/bin/python semantic_qa.py search "怎么把大问题拆成小问题" -k 8
-.venv-asr/bin/python semantic_qa.py search "过拟合" --course BV15J411T7WQ
+.venv-asr/bin/python semantic_qa.py search "过拟合" --course BV15J411T7WQ --min-score 0.45
 
-# 3. LLM 引用问答（需 LLM_API_KEY，同主脚本的环境变量）
+# 3. LLM 引用问答（需 LLM_API_KEY，同主脚本的环境变量）；默认相似度阈值 0.42 过滤弱相关片段
 .venv-asr/bin/python semantic_qa.py ask "哪几节讲了过拟合？该怎么处理？"
 
 # 4. 索引统计

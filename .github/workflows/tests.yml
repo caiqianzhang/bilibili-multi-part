@@ -1,0 +1,16 @@
+name: tests
+
+on: [push, pull_request, workflow_dispatch]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 安装依赖（无需 torch：RAG 测试只用到 numpy）
+        run: pip install numpy requests yt-dlp openai
+      - name: 运行核心回归套件
+        run: python tests/test_core.py

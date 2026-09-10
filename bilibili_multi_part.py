@@ -1704,6 +1704,9 @@ def main(argv=None):
             if args.verbose:
                 raise
             return 1
+        if not results:
+            print(f"搜索「{args.search}」无结果")
+            return 1
         print(f"\n===== 搜索结果: {args.search} ({len(results)} 条) =====")
         for r in results:
             print(f"  {r.bvid} | {r.title[:50]} | {r.uploader} | {r.duration:.0f}s")

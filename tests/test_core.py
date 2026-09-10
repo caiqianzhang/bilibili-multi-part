@@ -243,6 +243,9 @@ def test_semantic_qa():
         ok("srt 解析含时间边界", len(segs) == 2 and abs(segs[0][0] - 1.0) < 1e-6 and abs(segs[1][1] - 6.0) < 1e-6)
         chunks = sq.make_chunks(segs, 450)
         ok("切块保留时间边界", len(chunks) == 1 and chunks[0][1] == 1.0 and chunks[0][2] == 6.0)
+        ok("智能拼接：中文无空格/英文留空格",
+           sq._join_texts(["你好", "世界"]) == "你好世界"
+           and sq._join_texts(["hello", "world"]) == "hello world")
 
         con = sq.connect(os.path.join(tmp, "t.db"))
         ok("WAL 已启用", con.execute("PRAGMA journal_mode").fetchone()[0] == "wal")
@@ -275,17 +278,23 @@ def test_download_parallel():
     print("【并行下载编排】")
     OUT = tempfile.mkdtemp(prefix="t_par_")
     state = {"view": 0}
+    conc = {"cur": 0, "max": 0}
 
     def fake_view(bvid, cookie=""):
         state["view"] += 1
         return {"title": "t", "pages": [{"cid": i, "part": f"P{i}"} for i in range(1, 7)]}
 
     def fake_dl(url, output_dir=None, quality="fast"):
-        time.sleep(0.2)  # 模拟网络下载耗时
-        if url.endswith("p=4"):
-            raise RuntimeError("网络抖动")
-        return bmp.AudioDownloadResult(os.path.join(output_dir, "a.mp3"), "t", 1.0,
-                                       None, "bilibili", "BV1bK411W797_p1", {})
+        conc["cur"] += 1
+        conc["max"] = max(conc["max"], conc["cur"])
+        try:
+            time.sleep(0.2)  # 模拟网络下载耗时
+            if url.endswith("p=4"):
+                raise RuntimeError("网络抖动")
+            return bmp.AudioDownloadResult(os.path.join(output_dir, "a.mp3"), "t", 1.0,
+                                           None, "bilibili", "BV1bK411W797_p1", {})
+        finally:
+            conc["cur"] -= 1
 
     class FakeFetcher:
         def __init__(self, cookie=None):
@@ -306,7 +315,8 @@ def test_download_parallel():
     ok("结果按分集号有序", [r.p for r in rs] == [1, 2, 3, 4, 5, 6])
     ok("失败集隔离且其余成功", rs[3].audio is None and "音频下载失败" in rs[3].error
        and all(r.audio for i, r in enumerate(rs) if i != 3))
-    ok("实际并发生效（6×0.2s/3 线程 ≈0.4s，串行需 1.2s）", dt < 0.9, f"({dt:.2f}s)")
+    ok("结构性并发断言：最大同时下载数 ≥2（不受机器快慢影响）", conc["max"] >= 2,
+       f"(max_concurrent={conc['max']}, {dt:.2f}s)")
     ok("view API 仍只调 1 次", state["view"] == 1)
     shutil.rmtree(OUT, ignore_errors=True)
 

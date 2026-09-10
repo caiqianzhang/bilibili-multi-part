@@ -44,6 +44,8 @@ MODEL_NAME = "BAAI/bge-m3"
 EMB_DIM = 1024
 # bge-m3 支持 8192；中文在 XLM-R 分词下约 1.3 token/字，450 字块给 768 防截断
 MAX_LEN = 768
+# 索引结构版本：嵌入文本格式（上下文前缀）或嵌入参数变化时递增，触发全量重嵌
+INDEX_VERSION = "2"
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
       "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 VIEW_API = "https://api.bilibili.com/x/web-interface/view"
@@ -107,6 +109,21 @@ def load_part_titles(course_dir: str, bvid: str) -> dict:
     return titles
 
 
+def _join_texts(parts) -> str:
+    """字幕分段拼接：中文直接相连（旧版用空格会在句间引入杂噪），
+    两侧都是 ASCII 字母数字时保留一个空格，避免英文单词粘连成 "helloworld"。"""
+    out = ""
+    for t in parts:
+        t = t.strip()
+        if not t:
+            continue
+        if out and out[-1].isascii() and out[-1].isalnum() and t[0].isascii() and t[0].isalnum():
+            out += " " + t
+        else:
+            out += t
+    return out
+
+
 def make_chunks(segs, chunk_chars: int):
     """相邻分段按字数聚合成 chunk，记录起止秒：[(text, start, end, n_chars)]。"""
     chunks, buf, start, n = [], [], None, 0
@@ -116,10 +133,10 @@ def make_chunks(segs, chunk_chars: int):
         buf.append(text)
         n += len(text)
         if n >= chunk_chars:
-            chunks.append((" ".join(buf), start, e, n))
+            chunks.append((_join_texts(buf), start, e, n))
             buf, n = [], 0
     if buf:
-        chunks.append((" ".join(buf), start, segs[-1][1], n))
+        chunks.append((_join_texts(buf), start, segs[-1][1], n))
     return chunks
 
 
@@ -251,8 +268,16 @@ def build(args):
     con = connect(db_path)
     ensure_schema(con, root)
 
+    # 索引版本/嵌入参数与当前代码不一致 → 新旧向量不可混用，视为全部过期强制重嵌
+    meta = dict(con.execute("SELECT key, value FROM meta"))
+    stale_index = meta.get("index_version") != INDEX_VERSION or \
+        (meta.get("max_len") or str(MAX_LEN)) != str(MAX_LEN)
+    if stale_index:
+        log("索引版本/嵌入参数已变化(index_version %r→%s, max_len %r→%s)，本次全量重嵌",
+            meta.get("index_version"), INDEX_VERSION, meta.get("max_len"), MAX_LEN)
+
     # 指纹比对：只重嵌字幕有变化的课程（--force 全量）
-    existing_fp = dict(con.execute("SELECT bvid, fingerprint FROM courses"))
+    existing_fp = {} if stale_index else dict(con.execute("SELECT bvid, fingerprint FROM courses"))
     jobs, skipped = [], 0
     for cdir in course_dirs:
         bvid = os.path.basename(cdir)
@@ -288,13 +313,20 @@ def build(args):
             continue
         fp = course_fingerprint(srts)
         titles = load_part_titles(cdir, bvid)
+        # 课程标题优先复用库内已知值，避免每次全量重建都打一轮 view API
+        row = con.execute("SELECT title FROM courses WHERE bvid=?", (bvid,)).fetchone()
+        course_title = row[0] if row and row[0] else \
+            ("" if args.offline else fetch_course_title(bvid, cookie))
 
         texts, meta_rows = [], []
         for p in sorted(srts):
             segs = parse_srt(srts[p])
+            part = titles.get(p) or f"P{p}"
             for text, s, e, n in make_chunks(segs, args.chunk_chars):
-                meta_rows.append((bvid, p, titles.get(p) or f"P{p}", s, e, n))
-                texts.append(text)
+                meta_rows.append((bvid, p, part, s, e, n))
+                # 上下文化嵌入：向量携带课程/分集上下文以跨课程消歧；存库文本保持纯净
+                ctx = f"【{course_title} | P{p} {part}】" if course_title else f"【P{p} {part}】"
+                texts.append(ctx + text)
         if not texts:
             log("[%d/%d] %s 全部字幕为空，跳过", ci, len(jobs), bvid)
             continue
@@ -308,7 +340,6 @@ def build(args):
              for (bvid, mp, mt, ms, me, mn), mt_text, vec
              in zip(meta_rows, texts, vectors)])
 
-        course_title = "" if args.offline else fetch_course_title(bvid, cookie)
         con.execute("INSERT OR REPLACE INTO courses VALUES(?,?,?,?,?,?,?)",
                     (bvid, course_title, len(srts), len(texts),
                      sum(r[5] for r in meta_rows),
@@ -321,6 +352,8 @@ def build(args):
 
     con.execute("INSERT OR REPLACE INTO meta VALUES('model',?)", (MODEL_NAME,))
     con.execute("INSERT OR REPLACE INTO meta VALUES('chunk_chars',?)", (str(args.chunk_chars),))
+    con.execute("INSERT OR REPLACE INTO meta VALUES('max_len',?)", (str(MAX_LEN),))
+    con.execute("INSERT OR REPLACE INTO meta VALUES('index_version',?)", (INDEX_VERSION,))
     con.execute("INSERT OR REPLACE INTO meta VALUES('built_at',?)", (datetime.now().isoformat(timespec="seconds"),))
     con.commit()
     log("建索引完成: %d 课程, %d chunk, 耗时 %.0fs → %s",
@@ -348,34 +381,21 @@ def semantic_search(args) -> int:
         return 1
     con = connect(db_path)
     t0 = time.time()
-    ids, mat = load_matrix(con)
-    emb = Embedder(batch_size=8)
-    q = emb.encode([args.query])[0]
-    scores = mat @ q
-    if args.course:
-        id2key = dict(con.execute("SELECT id, bvid FROM chunks").fetchall())
-        mask = np.array([args.course.lower() in id2key[i].lower() for i in ids])
-        scores = np.where(mask, scores, -1.0)
-    top = np.argsort(-scores)[:args.k]
+    hits, total = retrieve(con, args.query, args.k, args.course,
+                           min_score=args.min_score)
     dt = (time.time() - t0) * 1000
 
-    print(f"\n===== 「{args.query}」 语义检索 top-{args.k}（{dt:.0f}ms, 语料 {len(ids)} chunks）=====")
-    shown = 0
-    for rank, i in enumerate(top, 1):
-        if scores[i] < 0:
-            break
-        shown = rank
-        bvid, p, part, s, text = con.execute(
-            "SELECT bvid,p,part_title,start,text FROM chunks WHERE id=?", (int(ids[i]),)).fetchone()
-        course = con.execute("SELECT title FROM courses WHERE bvid=?", (bvid,)).fetchone()
-        cname = (course[0] if course and course[0] else bvid)[:24]
-        snippet = text[:110] + ("…" if len(text) > 110 else "")
-        print(f"\n[{rank}] 相似度 {scores[i]:.3f} | {cname} | P{p} {part} @ {fmt_ts(s)}")
-        print(f"    {snippet}")
-        print(f"    → {jump_url(bvid, p, s)}")
-    if not shown:
-        log("无命中结果")
+    print(f"\n===== 「{args.query}」 语义检索（{dt:.0f}ms, 语料 {total:,} chunks, "
+          f"阈值 {args.min_score:.2f}）=====")
+    if not hits:
+        log("无命中结果（可尝试降低 --min-score 或换措辞）")
         return 1
+    for rank, h in enumerate(hits, 1):
+        cname = h["course"][:24]
+        snippet = h["text"][:110] + ("…" if len(h["text"]) > 110 else "")
+        print(f"\n[{rank}] 相似度 {h['score']:.3f} | {cname} | P{h['p']} {h['part']} @ {fmt_ts(h['start'])}")
+        print(f"    {snippet}")
+        print(f"    → {jump_url(h['bvid'], h['p'], h['start'])}")
     return 0
 
 
@@ -396,9 +416,13 @@ ASK_PROMPT = """你是 B 站课程字幕知识库的问答助手。仅依据下�
 """
 
 
-def retrieve(con, query: str, k: int, course: str = ""):
+def retrieve(con, query: str, k: int, course: str = "", min_score: float = 0.0,
+             emb=None):
+    """统一检索入口（search/ask 共用）：加载矩阵 → 编码 → 打分 → 课程过滤 → 阈值 → top-k。
+
+    返回 (hits, total)；hit 含 score/bvid/p/part/start/text/course。"""
     ids, mat = load_matrix(con)
-    emb = Embedder(batch_size=8)
+    emb = emb or Embedder(batch_size=8)
     q = emb.encode([query])[0]
     scores = mat @ q
     if course:
@@ -406,16 +430,18 @@ def retrieve(con, query: str, k: int, course: str = ""):
         mask = np.array([course.lower() in id2key[i].lower() for i in ids])
         scores = np.where(mask, scores, -1.0)
     top = np.argsort(-scores)[:k]
+    floor = max(0.0, min_score)
     hits = []
     for i in top:
-        if scores[i] < 0:
+        if scores[i] < floor:
             break
         row = con.execute(
             "SELECT c.bvid,c.p,c.part_title,c.start,c.text,co.title FROM chunks c "
             "LEFT JOIN courses co ON co.bvid=c.bvid WHERE c.id=?", (int(ids[i]),)).fetchone()
         hits.append({"score": float(scores[i]), "bvid": row[0], "p": row[1],
                      "part": row[2], "start": row[3], "text": row[4], "course": row[5] or row[0]})
-    return hits
+    total = con.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+    return hits, total
 
 
 def ask(args) -> int:
@@ -436,7 +462,8 @@ def ask(args) -> int:
 
     con = connect(db_path)
     t0 = time.time()
-    hits = retrieve(con, args.question, args.k, args.course)
+    hits, _ = retrieve(con, args.question, args.k, args.course,
+                       min_score=args.min_score)
     if not hits:
         log("检索无结果")
         return 1
@@ -539,12 +566,16 @@ def main(argv=None):
     s.add_argument("query")
     s.add_argument("-k", type=int, default=8)
     s.add_argument("--course", default="", help="限定课程（bvid 子串）")
+    s.add_argument("--min-score", type=float, default=0.0,
+                   help="相似度阈值（默认 0 显示全部 top-k）")
 
     a = sub.add_parser("ask", help="LLM 引用问答（需 LLM_API_KEY）")
     add_common(a)
     a.add_argument("question")
     a.add_argument("-k", type=int, default=6)
     a.add_argument("--course", default="", help="限定课程（bvid 子串）")
+    a.add_argument("--min-score", type=float, default=0.42,
+                   help="相似度阈值（默认 0.42，过滤弱相关片段避免误导 LLM）")
     a.add_argument("--model", default=os.environ.get("LLM_MODEL", "gpt-4o-mini"))
 
     st = sub.add_parser("stats", help="索引统计")

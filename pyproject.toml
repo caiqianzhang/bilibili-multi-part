@@ -5,11 +5,11 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "bilibili-multi-part"
 version = "1.0.0"
-description = "B 站分 P 视频全部分集下载 + LLM 笔记生成（自包含脚本）"
+description = "B站多P课程视频批量下载 + 字幕/本地转写 + 语义问答（RAG）"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
-authors = [{ name = "BiliNote" }]
+authors = [{ name = "caiqianzhang" }]
 dependencies = [
     "yt-dlp>=2024.0.0",
     "requests>=2.31.0",
@@ -24,4 +24,4 @@ base = ["yt-dlp>=2024.0.0", "requests>=2.31.0"]
 bilibili-multi-part = "bilibili_multi_part:main"
 
 [tool.setuptools]
-py-modules = ["bilibili_multi_part"]
+py-modules = ["bilibili_multi_part", "semantic_qa"]
